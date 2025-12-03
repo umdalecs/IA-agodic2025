@@ -1,0 +1,8 @@
+# Machine specific files
+.venv
+
+# Large space data
+dataset
+cropped_dataset
+
+model
