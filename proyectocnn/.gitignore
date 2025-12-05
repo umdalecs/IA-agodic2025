@@ -3,6 +3,4 @@
 
 # Large space data
 dataset
-cropped_dataset
-
-model
+dataset_faces_clean

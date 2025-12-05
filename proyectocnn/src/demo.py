@@ -5,12 +5,13 @@ import cv2
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras.models import load_model
+import pickle
 
 root_dir = Path(__file__).resolve().parent.parent
 
 # Parametros
-MODEL_PATH = os.path.join(root_dir, "model", "face_classifier.h5")
-TAGS_PATH = os.path.join(root_dir, "model", "tags.json")
+MODEL_PATH = os.path.join(root_dir, "models", "face_classifier.h5")
+TAGS_PATH = os.path.join(root_dir, "models", "labels.pkl")
 IMG_SIZE = (224, 224)
 
 try:
@@ -21,9 +22,12 @@ except Exception as e:
     print(f"Error al cargar el modelo .h5: {e}")
     exit()
 
-with open(TAGS_PATH, "r") as f:
+with open(TAGS_PATH, "rb") as f:
     global CLASS_NAMES
-    CLASS_NAMES = json.load(f)
+
+    label_map = pickle.load(f)
+    CLASS_NAMES = {v:k for k,v in label_map.items()}
+
 
 face_classifier = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"

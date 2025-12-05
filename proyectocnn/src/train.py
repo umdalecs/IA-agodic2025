@@ -1,34 +1,126 @@
-from pathlib import Path
 import os
-import json
-import tensorflow as tf
-from tensorflow.keras import layers, models, optimizers, callbacks
-from tensorflow.keras.layers import Input
-from tensorflow.keras.applications import MobileNetV2
+import cv2
+import numpy as np
+import pickle
+import shutil
+from mtcnn.mtcnn import MTCNN
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.layers import GlobalAveragePooling2D, Dropout, Flatten, Dense, Input
+from tensorflow.keras.models import Model
+from tensorflow.keras.optimizers import Adam
 
-root_dir = Path(__file__).resolve().parent.parent
+# --- CONFIGURACIÓN DE DIRECTORIOS ---
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ORIGINAL_DATASET_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'dataset'))
+PROCESSED_DATASET_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'dataset_faces_clean'))
+MODEL_DIR = os.path.abspath(os.path.join(BASE_DIR, '..', 'models'))
 
-CROPPED_DATASET_DIR = os.path.join(root_dir, "cropped_dataset")
-MODEL_PATH = os.path.join(root_dir, "model", "face_classifier.h5")
-TAGS_PATH = os.path.join(root_dir, "model", "tags.json")
+os.makedirs(MODEL_DIR, exist_ok=True)
 
-# Hiper parametros
-LEARNING_RATE = 1e-4
-EPOCHS_HEAD = 28
-EPOCHS_FINE = 12
-BATCH_SIZE = 32
+# --- HIPERPARÁMETROS ---
+INIT_LR = 1e-4
+EPOCHS_HEAD = 36    # Épocas iniciales
+EPOCHS_FINE = 15    # Épocas de ajuste fino (Subí un poco esto)
+BS = 32
 IMAGE_SIZE = (224, 224)
 
-os.makedirs(Path(MODEL_PATH).parent.resolve(), exist_ok=True)
-os.makedirs(Path(TAGS_PATH).parent.resolve(), exist_ok=True)
+def create_face_dataset_safe(input_dir, output_dir):
+    print("[INFO] Cargando detector MTCNN...")
+    detector = MTCNN()
+    
+    total_images = 0
+    faces_saved = 0
+    errors = 0
 
-tags = os.listdir(CROPPED_DATASET_DIR)
-with open(TAGS_PATH, "w") as f:
-    json.dump(tags, f)
+    print(f"[INFO] Procesando (o reanudando) imágenes desde: {input_dir}")
 
-train_aug = ImageDataGenerator(
-    rescale=1.0 / 255,
+    for root, dirs, files in os.walk(input_dir):
+        for file in files:
+            if file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                total_images += 1
+                
+                # Definir rutas
+                image_path = os.path.join(root, file)
+                rel_path = os.path.relpath(root, input_dir)
+                output_subdir = os.path.join(output_dir, rel_path)
+                output_path = os.path.join(output_subdir, file)
+                
+                # --- LÓGICA DE REANUDACIÓN ---
+                # Si la imagen ya existe, saltar (ahorra tiempo de lo que ya hiciste ayer)
+                if os.path.exists(output_path):
+                    faces_saved += 1
+                    if total_images % 1000 == 0:
+                        print(f"[REANUDANDO] Revisadas {total_images} imágenes...")
+                    continue
+
+                os.makedirs(output_subdir, exist_ok=True)
+                
+                try:
+                    # Leer imagen
+                    img = cv2.imread(image_path)
+                    if img is None: continue
+                    
+                    # --- PROTECCIÓN DE MEMORIA (FIX PARA TU ERROR) ---
+                    # Si la imagen es gigante (>1200px), la redimensionamos antes de detectar
+                    h, w = img.shape[:2]
+                    max_dim = 1200
+                    if h > max_dim or w > max_dim:
+                        scale = max_dim / max(h, w)
+                        img = cv2.resize(img, None, fx=scale, fy=scale)
+                    
+                    # Convertir a RGB
+                    rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    
+                    # Detectar caras
+                    results = detector.detect_faces(rgb_img)
+                    
+                    if results:
+                        best_face = None
+                        max_area = 0
+
+                        for res in results:
+                            # Filtro de confianza > 95%
+                            if res['confidence'] > 0.95:
+                                x, y, w_box, h_box = res['box']
+                                if w_box * h_box > max_area:
+                                    max_area = w_box * h_box
+                                    best_face = (x, y, w_box, h_box)
+                        
+                        if best_face:
+                            (x, y, w_box, h_box) = best_face
+                            # Padding y recortes seguros
+                            x, y = max(0, x), max(0, y)
+                            p = 20 
+                            x = max(0, x - p)
+                            y = max(0, y - p)
+                            w_box = min(img.shape[1] - x, w_box + 2*p)
+                            h_box = min(img.shape[0] - y, h_box + 2*p)
+                            
+                            face_crop = img[y:y+h_box, x:x+w_box]
+                            
+                            if face_crop.shape[0] > 50 and face_crop.shape[1] > 50:
+                                cv2.imwrite(output_path, face_crop)
+                                faces_saved += 1
+                                print(f"[OK] Procesada nueva: {rel_path}")
+
+                except Exception as e:
+                    print(f"[ERROR] Falló la imagen {rel_path}. Saltando...")
+                    # print(e) # Descomentar si quieres ver el error específico
+                    errors += 1
+                    continue
+
+    print(f"\n[FIN PROCESAMIENTO]")
+    print(f"Total imágenes revisadas: {total_images}")
+    print(f"Total caras válidas en disco: {faces_saved}")
+    print(f"Errores saltados: {errors}")
+
+create_face_dataset_safe(ORIGINAL_DATASET_DIR, PROCESSED_DATASET_DIR)
+
+print(f"[INFO] Cargando generadores de datos...")
+
+trainAug = ImageDataGenerator(
+    rescale=1./255,
     rotation_range=20,
     zoom_range=0.15,
     width_shift_range=0.2,
@@ -36,83 +128,80 @@ train_aug = ImageDataGenerator(
     shear_range=0.15,
     horizontal_flip=True,
     fill_mode="nearest",
-    validation_split=0.2,
+    validation_split=0.2
 )
 
-train_gen = train_aug.flow_from_directory(
-    CROPPED_DATASET_DIR,
+trainGen = trainAug.flow_from_directory(
+    PROCESSED_DATASET_DIR,
     target_size=IMAGE_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode="categorical",
-    subset="training",
-    shuffle=True,
+    batch_size=BS,
+    class_mode='categorical',
+    subset='training'
 )
 
-val_gen = train_aug.flow_from_directory(
-    CROPPED_DATASET_DIR,
+valGen = trainAug.flow_from_directory(
+    PROCESSED_DATASET_DIR,
     target_size=IMAGE_SIZE,
-    batch_size=BATCH_SIZE,
-    class_mode="categorical",
-    subset="validation",
+    batch_size=BS,
+    class_mode='categorical',
+    subset='validation'
 )
 
-# Base model
-base_model = MobileNetV2(
-    input_tensor=Input(shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3)),
-    include_top=False,
-    weights="imagenet",
-)
+if trainGen.samples == 0:
+    print("[ERROR] No hay imágenes. Algo falló en la etapa de MTCNN.")
+    exit()
 
-x = base_model.output
-x = layers.GlobalAveragePooling2D()(x)
-x = layers.BatchNormalization()(x)
-x = layers.Dropout(0.5)(x)
-x = layers.Dense(512, activation="relu")(x)
-x = layers.Dropout(0.4)(x)
-x = layers.Dense(256)(x)
-x = layers.BatchNormalization()(x)
-x = layers.Dropout(0.3)(x)
-x = layers.Dense(128, activation="relu")(x)
-outputs = layers.Dense(train_gen.num_classes, activation="softmax")(x)
+print("[INFO] Construyendo MobileNetV2 Mejorado...")
+baseModel = MobileNetV2(weights="imagenet", include_top=False,
+                        input_tensor=Input(shape=(IMAGE_SIZE[0], IMAGE_SIZE[1], 3)))
 
-model = models.Model(base_model.input, outputs)
+headModel = baseModel.output
+headModel = GlobalAveragePooling2D()(headModel)
+headModel = Dense(1024, activation="relu")(headModel)
+headModel = Dropout(0.5)(headModel)
+headModel = Dense(trainGen.num_classes, activation="softmax")(headModel)
 
-model.summary()
+model = Model(inputs=baseModel.input, outputs=headModel)
 
-print("----------------Head Training---------------")
+# --- FASE 1: ENTRENAMIENTO DE LA CABEZA ---
+for layer in baseModel.layers:
+    layer.trainable = False
 
-base_model.trainable = False
-
-model.compile(
-    optimizer=optimizers.Adam(learning_rate=LEARNING_RATE),
-    loss="categorical_crossentropy",
-    metrics=["accuracy"],
-)
+print("[INFO] Entrenando cabeza (Fase 1)...")
+model.compile(loss="categorical_crossentropy", optimizer=Adam(learning_rate=INIT_LR),
+              metrics=["accuracy"])
 
 model.fit(
-    train_gen,
-    validation_data=val_gen,
-    steps_per_epoch=len(train_gen),
-    validation_steps=len(val_gen),
-    epochs=EPOCHS_HEAD,
+    trainGen,
+    steps_per_epoch=len(trainGen),
+    validation_data=valGen,
+    validation_steps=len(valGen),
+    epochs=EPOCHS_HEAD
 )
 
-print("----------------Fine tuning---------------")
-for layer in base_model.layers[-50:]:
+# --- FASE 2: FINE-TUNING ---
+print("[INFO] Descongelando capas para Fine-Tuning (Fase 2)...")
+# Descongelamos un poco más (40 capas) para dar más libertad al modelo
+for layer in baseModel.layers[-40:]:
     layer.trainable = True
 
-model.compile(
-    optimizer=optimizers.Adam(learning_rate=LEARNING_RATE / 10),
-    loss="categorical_crossentropy",
-    metrics=["accuracy"],
-)
+print("[INFO] Re-compilando con Learning Rate bajo...")
+model.compile(loss="categorical_crossentropy", optimizer=Adam(learning_rate=INIT_LR/10),
+              metrics=["accuracy"])
 
 model.fit(
-    train_gen, 
-    steps_per_epoch=len(train_gen),
-    validation_steps=len(val_gen),
-    validation_data=val_gen, 
+    trainGen,
+    steps_per_epoch=len(trainGen),
+    validation_data=valGen,
+    validation_steps=len(valGen),
     epochs=EPOCHS_FINE
 )
 
-model.save(MODEL_PATH)
+model_path = os.path.join(MODEL_DIR, 'face_classifier.h5')
+model.save(model_path)
+print(f'[INFO] Modelo guardado en {model_path}')
+
+label_map = trainGen.class_indices
+with open(os.path.join(MODEL_DIR, 'labels.pkl'), 'wb') as f:
+    pickle.dump(label_map, f)
+print('[INFO] Label encoder guardado.')
